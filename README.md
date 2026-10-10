@@ -1,6 +1,6 @@
 # Drive Index Utility
 
-A small AppleScript app that lists the folders on a mounted drive, two levels deep, and saves them to `~/Documents/Archival Drive Indexes/<Drive Name>.txt`. Each run replaces that drive's previous list.
+A small AppleScript app that indexes a mounted drive and saves a text report to `~/Documents/External Drive Index/<Drive Name>.txt`. The report has the drive's details, two levels of folders, and the size of each top-level folder. Each run replaces that drive's previous report.
 
 ## Build
 
