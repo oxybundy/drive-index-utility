@@ -15,6 +15,15 @@ struct Drive: Identifiable, Equatable {
             case .diskImage: return "Disk images"
             }
         }
+
+        var help: String {
+            switch self {
+            case .external: return "Drives connected over USB, Thunderbolt and similar."
+            case .internal: return "Other drives inside this Mac. The startup disk is never indexed."
+            case .network: return "Shared folders on other computers and servers."
+            case .diskImage: return "Mounted disk image files, such as .dmg files."
+            }
+        }
     }
 
     enum Medium: String, CaseIterable, Codable {
@@ -25,7 +34,16 @@ struct Drive: Identifiable, Equatable {
             case .ssd: return "SSD"
             case .spinning: return "Spinning"
             case .card: return "Memory cards"
-            case .unknown: return "Unknown"
+            case .unknown: return "Other"
+            }
+        }
+
+        var help: String {
+            switch self {
+            case .ssd: return "Solid-state drives."
+            case .spinning: return "Hard drives with spinning disks."
+            case .card: return "SD, CFast, CFexpress and other memory cards."
+            case .unknown: return "Drives that don't say whether they're an SSD or a spinning disk. Some USB enclosures hide this."
             }
         }
     }

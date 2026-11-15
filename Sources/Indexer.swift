@@ -1,5 +1,6 @@
 import AppKit
 import CoreServices
+import DiskArbitration
 
 /// What's saved between runs for each drive, so later indexes only rescan folders that changed.
 struct DriveCache: Codable {
@@ -104,6 +105,10 @@ final class Indexer: ObservableObject {
     private var cancelFlags: [String: Bool] = [:]
     private let cancelLock = NSLock()
     private var afterIndex: [String: [() -> Void]] = [:]
+    private var ejectSession: DASession?
+    private var fullScanning: Set<String> = []
+    private var storeIDs: [String: String] = [:]
+    private let ejectQueue = DispatchQueue(label: "eject-approval", qos: .userInitiated)
 
     /// How long a drive has to be quiet before its changes are written to the reports.
     private let quietPeriod: TimeInterval = 30
@@ -124,6 +129,7 @@ final class Indexer: ObservableObject {
         center.addObserver(self, selector: #selector(volumesChanged(_:)), name: NSWorkspace.didUnmountNotification, object: nil)
         center.addObserver(self, selector: #selector(volumesChanged(_:)), name: NSWorkspace.didRenameVolumeNotification, object: nil)
         center.addObserver(self, selector: #selector(willUnmount(_:)), name: NSWorkspace.willUnmountNotification, object: nil)
+        registerEjectApproval()
         reloadDrives(indexNew: true)
     }
 
@@ -136,11 +142,10 @@ final class Indexer: ObservableObject {
     @objc private func willUnmount(_ note: Notification) {
         guard let url = note.userInfo?[NSWorkspace.volumeURLUserInfoKey] as? URL,
               let drive = drives.first(where: { $0.url == url }) else { return }
-        // Anything not yet applied stays in the drive's change log and is replayed next time it's connected.
-        stopWatching(drive.id)
-        pending[drive.id] = nil
-        pendingEventID[drive.id] = nil
-        cancel(drive.id)
+        // macOS posts this before it asks apps to approve the unmount, so the watcher and pending changes
+        // are kept for `beforeUnmount` and cleared once the drive is gone. A full scan is stopped, since
+        // its open folders would hold the drive.
+        if fullScanning.contains(drive.id) { cancel(drive.id) }
     }
 
     private func reloadDrives(indexNew: Bool) {
@@ -149,15 +154,19 @@ final class Indexer: ObservableObject {
         let current = Set(drives.map(\.id))
 
         for id in old.subtracting(current) {
+            // Changes not yet applied stay in the drive's change log and are replayed next time.
             stopWatching(id)
             cancel(id)
+            storeIDs[id] = nil
+            pending[id] = nil
+            pendingEventID[id] = nil
         }
         if old != current { writeCatalog() }
 
         guard indexNew else { onChange?(); return }
         for drive in drives where !old.contains(drive.id) {
             if settings.indexOnConnect && settings.indexesAutomatically(drive) {
-                index(drive)
+                indexWhenLogReady(drive)
             }
         }
         onChange?()
@@ -178,12 +187,9 @@ final class Indexer: ObservableObject {
         guard !isBusy(drive.id) else { return }
 
         let sizes = settings.includesSizes(drive)
-        let cache = cachedTree(drive.id)
-        let store = ChangeWatcher.storeID(for: drive)
-        let canCatchUp = !full && drive.location != .network && cache != nil && cache?.sizes == sizes
-            && store != nil && cache?.store == store && cache?.eventID != nil
+        let store = storeID(for: drive)
 
-        if canCatchUp, let cache {
+        if !full, canCatchUp(drive), let cache = cachedTree(drive.id) {
             if watchers[drive.id] != nil {
                 flushPending(drive.id)
             } else {
@@ -194,14 +200,88 @@ final class Indexer: ObservableObject {
         }
     }
 
+    /// The drive's change-log ID, remembered for as long as the drive is mounted. fseventsd has no answer
+    /// for the first moments after a mount, so a missing ID isn't remembered and is asked for again later.
+    private func storeID(for drive: Drive, lookUp: Bool = true) -> String? {
+        if let known = storeIDs[drive.id] { return known }
+        guard lookUp, let id = ChangeWatcher.storeID(for: drive) else { return nil }
+        storeIDs[drive.id] = id
+        return id
+    }
+
+    /// Indexes a newly connected drive. A drive that was indexed before waits a few seconds for fseventsd
+    /// to load its change log, so it gets a quick catch-up instead of a full rescan.
+    private func indexWhenLogReady(_ drive: Drive, attempt: Int = 0) {
+        let expectsLog = drive.location != .network && cachedTree(drive.id)?.store != nil
+        if !expectsLog || storeID(for: drive) != nil || attempt >= 10 {
+            index(drive)
+            return
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+            guard let self, let current = self.drive(drive.id) else { return }
+            self.indexWhenLogReady(current, attempt: attempt + 1)
+        }
+    }
+
+    /// True when the saved tree can be brought up to date from the drive's change log instead of a full scan.
+    /// During an eject `lookUp` is false: asking fseventsd for the ID then makes it reopen its log on the
+    /// drive and refuse the eject.
+    private func canCatchUp(_ drive: Drive, lookUp: Bool = true) -> Bool {
+        guard drive.location != .network, let cache = cachedTree(drive.id), cache.eventID != nil,
+              cache.sizes == settings.includesSizes(drive) else { return false }
+        let store = storeID(for: drive, lookUp: lookUp)
+        return store != nil && cache.store == store
+    }
+
+    // MARK: Eject
+
+    /// Asks macOS to check with this app before any volume is unmounted.
+    private func registerEjectApproval() {
+        guard let session = DASessionCreate(kCFAllocatorDefault) else { return }
+        DASessionSetDispatchQueue(session, ejectQueue)
+        DARegisterDiskUnmountApprovalCallback(session, nil, { disk, context in
+            Unmanaged<Indexer>.fromOpaque(context!).takeUnretainedValue().beforeUnmount(disk)
+            return nil // always approve; this only buys time to finish the index
+        }, Unmanaged.passUnretained(self).toOpaque())
+        ejectSession = session
+    }
+
+    /// Runs on `ejectQueue` while macOS waits. Applies pending changes, then lets the eject continue.
+    /// Only drives that already have an index are updated here; a first full scan could take too long.
+    private func beforeUnmount(_ disk: DADisk) {
+        guard let description = DADiskCopyDescription(disk) as? [CFString: Any],
+              let url = description[kDADiskDescriptionVolumePathKey] as? URL else { return }
+        let done = DispatchSemaphore(value: 0)
+        var waiting = false
+        DispatchQueue.main.sync {
+            // Only a drive with a live watcher is updated: replaying its change log instead would make
+            // fseventsd reopen the log on the drive and refuse the eject.
+            guard settings.indexOnEject,
+                  let drive = drives.first(where: { $0.url.standardizedFileURL.path == url.standardizedFileURL.path }),
+                  watchers[drive.id] != nil, !fullScanning.contains(drive.id),
+                  canCatchUp(drive, lookUp: false) else { return }
+            waiting = true
+            // Change events arrive in one-second batches; wait for the last batch rather than asking
+            // fseventsd to flush, which keeps it busy writing to the drive and makes it refuse the eject.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) {
+                self.index(drive) { done.signal() }
+            }
+        }
+        if waiting { _ = done.wait(timeout: .now() + 8) }
+    }
+
     func indexAndEject(_ drive: Drive) {
         index(drive) { [weak self] in
             guard let self, let current = self.drive(drive.id) else { return }
-            self.stopWatching(drive.id)
-            do {
-                try NSWorkspace.shared.unmountAndEjectDevice(at: current.url)
-            } catch {
-                self.activity[drive.id] = .failed("Couldn't eject: \(error.localizedDescription)")
+            // Ejecting waits for unmount approval, which is answered on the main thread, so eject from elsewhere.
+            DispatchQueue.global(qos: .userInitiated).async {
+                do {
+                    try NSWorkspace.shared.unmountAndEjectDevice(at: current.url)
+                } catch {
+                    DispatchQueue.main.async {
+                        self.activity[drive.id] = .failed("Couldn't eject: \(error.localizedDescription)")
+                    }
+                }
             }
         }
     }
@@ -224,6 +304,7 @@ final class Indexer: ObservableObject {
 
     private func fullScan(_ drive: Drive, sizes: Bool, store: String?) {
         cancelLock.lock(); cancelFlags[drive.id] = false; cancelLock.unlock()
+        fullScanning.insert(drive.id)
         activity[drive.id] = .scanning(sizes ? "Starting…" : "Listing folders…", nil)
         stopWatching(drive.id)
 
@@ -247,16 +328,23 @@ final class Indexer: ObservableObject {
             }
             do {
                 let tree = try scanner.scanAll()
-                let cache = DriveCache(id: drive.id, name: drive.name, indexed: Date(), sizes: sizes,
-                                       store: store, eventID: store == nil ? nil : startEvent, tree: tree)
-                DispatchQueue.main.async { self.finish(drive, cache: cache) }
+                DispatchQueue.main.async {
+                    self.fullScanning.remove(drive.id)
+                    // The change-log ID may not have been available yet when the scan started.
+                    let store = store ?? (drive.location == .network ? nil : self.storeID(for: drive))
+                    let cache = DriveCache(id: drive.id, name: drive.name, indexed: Date(), sizes: sizes,
+                                           store: store, eventID: store == nil ? nil : startEvent, tree: tree)
+                    self.finish(drive, cache: cache)
+                }
             } catch is ScanCancelled {
                 DispatchQueue.main.async {
+                    self.fullScanning.remove(drive.id)
                     self.activity[drive.id] = .idle
                     self.afterIndex[drive.id] = nil
                 }
             } catch {
                 DispatchQueue.main.async {
+                    self.fullScanning.remove(drive.id)
                     self.activity[drive.id] = .failed("Couldn't read the drive: \(error.localizedDescription)")
                     self.afterIndex[drive.id] = nil
                 }
@@ -316,11 +404,12 @@ final class Indexer: ObservableObject {
             return
         }
         if changes.contains(where: { $0.deep && $0.path.isEmpty }) {
-            fullScan(drive, sizes: cache.sizes, store: ChangeWatcher.storeID(for: drive))
+            fullScan(drive, sizes: cache.sizes, store: storeID(for: drive))
             return
         }
 
         activity[id] = .scanning("Updating changed folders…", nil)
+        cancelLock.lock(); cancelFlags[id] = false; cancelLock.unlock()
         queue(for: id).async { [weak self] in
             guard let self else { return }
             let scanner = Scanner(root: drive.url, withSizes: cache.sizes, parallel: 1) { [weak self] in
@@ -342,8 +431,14 @@ final class Indexer: ObservableObject {
                 cache.indexed = Date()
                 if let lastEvent { cache.eventID = max(cache.eventID ?? 0, lastEvent) }
                 DispatchQueue.main.async { self.finish(drive, cache: cache) }
+            } catch is ScanCancelled {
+                // The changes are still in the drive's change log and are picked up next time.
+                DispatchQueue.main.async {
+                    self.activity[id] = .idle
+                    self.runAfterIndex(id)
+                }
             } catch {
-                DispatchQueue.main.async { self.fullScan(drive, sizes: cache.sizes, store: ChangeWatcher.storeID(for: drive)) }
+                DispatchQueue.main.async { self.fullScan(drive, sizes: cache.sizes, store: self.storeID(for: drive)) }
             }
         }
     }
@@ -399,7 +494,7 @@ final class Indexer: ObservableObject {
         for drive in drives {
             let watching = watchers[drive.id] != nil
             if shouldWatch(drive) && !watching, let cache = cachedTree(drive.id), cache.eventID != nil,
-               cache.store == ChangeWatcher.storeID(for: drive) {
+               cache.store == storeID(for: drive) {
                 catchUp(drive, cache: cache)
             } else if !shouldWatch(drive) && watching {
                 stopWatching(drive.id)

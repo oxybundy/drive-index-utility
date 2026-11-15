@@ -2,9 +2,9 @@
 
 Keeps a record of what's on each of your drives: every folder and its size, saved as plain text and as a searchable catalog you can open on any device.
 
-- Indexes a drive when you connect it and keeps the index current while it's connected
+- Indexes a drive when you connect it, keeps the index current while it's connected, and brings it up to date when you eject it
 - **Index and Eject** from the menu bar
-- Choose which drives are indexed automatically: external, internal, network or disk images; SSDs, spinning disks or memory cards
+- Choose which drives are indexed automatically: external, internal, network or disk images, and for physical drives SSDs, spinning disks or memory cards
 - Saves reports to any folder. Pick one in iCloud Drive, Dropbox or Google Drive to read them on your phone
 - macOS 13 or later, Apple Silicon and Intel
 

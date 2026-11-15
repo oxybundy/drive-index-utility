@@ -38,6 +38,7 @@ final class Settings: ObservableObject {
     @Published var media: Set<Drive.Medium> { didSet { save(media.map(\.rawValue), "autoMedia") } }
     @Published var indexOnConnect: Bool { didSet { defaults.set(indexOnConnect, forKey: "indexOnConnect") } }
     @Published var keepUpdated: Bool { didSet { defaults.set(keepUpdated, forKey: "keepUpdated"); onChange?() } }
+    @Published var indexOnEject: Bool { didSet { defaults.set(indexOnEject, forKey: "indexOnEject") } }
     @Published var sizeMode: SizeMode { didSet { defaults.set(sizeMode.rawValue, forKey: "sizeMode") } }
     /// Folder levels in the text report; 0 means all.
     @Published var textLevels: Int { didSet { defaults.set(textLevels, forKey: "textLevels"); onChange?() } }
@@ -56,7 +57,7 @@ final class Settings: ObservableObject {
 
     private init() {
         defaults.register(defaults: [
-            "indexOnConnect": true, "keepUpdated": true, "sizeMode": SizeMode.exceptNetwork.rawValue,
+            "indexOnConnect": true, "keepUpdated": true, "indexOnEject": true, "sizeMode": SizeMode.exceptNetwork.rawValue,
             "textLevels": 3, "catalog": true, "showInMenuBar": true,
             "autoLocations": [Drive.Location.external.rawValue],
             "autoMedia": Drive.Medium.allCases.map(\.rawValue),
@@ -66,6 +67,7 @@ final class Settings: ObservableObject {
         media = Set((defaults.stringArray(forKey: "autoMedia") ?? []).compactMap(Drive.Medium.init))
         indexOnConnect = defaults.bool(forKey: "indexOnConnect")
         keepUpdated = defaults.bool(forKey: "keepUpdated")
+        indexOnEject = defaults.bool(forKey: "indexOnEject")
         sizeMode = SizeMode(rawValue: defaults.string(forKey: "sizeMode") ?? "") ?? .exceptNetwork
         textLevels = defaults.integer(forKey: "textLevels")
         catalog = defaults.bool(forKey: "catalog")
@@ -89,7 +91,13 @@ final class Settings: ObservableObject {
         switch rule(for: drive) {
         case .always: return true
         case .never: return false
-        case .auto: return locations.contains(drive.location) && media.contains(drive.medium)
+        case .auto:
+            guard locations.contains(drive.location) else { return false }
+            // Type only applies to physical drives; network drives and disk images have no hardware type.
+            switch drive.location {
+            case .network, .diskImage: return true
+            case .external, .internal: return media.contains(drive.medium)
+            }
         }
     }
 

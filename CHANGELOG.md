@@ -1,5 +1,12 @@
 # Changelog
 
+## 2.1.0
+
+- New **When a drive is ejected** setting: changes made just before ejecting are added to the index before the drive goes, whether you eject from Finder, the menu bar or the Terminal
+- The drive type checkboxes now only apply to external and internal drives; network drives and disk images follow the Where checkboxes alone
+- "Unknown" drive type is now called "Other", and every checkbox explains itself on hover
+- A drive that was indexed before now catches up from its change log when connected, instead of sometimes being rescanned in full
+
 ## 2.0.0
 
 Rewritten as a native app.

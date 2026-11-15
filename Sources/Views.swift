@@ -271,13 +271,15 @@ struct SettingsView: View {
                     ForEach(Drive.Location.allCases, id: \.self) { loc in
                         Toggle(loc.title, isOn: Binding(get: { settings.locations.contains(loc) },
                                                         set: { settings.set(loc, $0); Indexer.shared.settingsChanged() }))
+                        .help(loc.help)
                     }
                 }
                 Divider()
-                checkboxes("Type") {
+                checkboxes("Type of external or internal drive") {
                     ForEach(Drive.Medium.allCases, id: \.self) { m in
                         Toggle(m.title, isOn: Binding(get: { settings.media.contains(m) },
                                                       set: { settings.set(m, $0); Indexer.shared.settingsChanged() }))
+                        .help(m.help)
                     }
                 }
                 Divider()
@@ -294,6 +296,13 @@ struct SettingsView: View {
                         get: { settings.keepUpdated },
                         set: { settings.keepUpdated = $0; Indexer.shared.settingsChanged() })).labelsHidden()
                 }
+                Divider()
+                row {
+                    Text("When a drive is ejected")
+                    Spacer()
+                    Toggle("When a drive is ejected", isOn: $settings.indexOnEject).labelsHidden()
+                }
+                .help("Brings the index up to date before the drive is ejected, so the catalog matches what's on it.")
             }
             .padding(.bottom, 16)
 
